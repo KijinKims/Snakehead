@@ -1,4 +1,4 @@
-from typing import NewType
+from typing import NewType, Set, Tuple, List
 from collections import defaultdict, deque
 from pathlib import Path, PurePath
 import copy
@@ -16,8 +16,12 @@ import argparse
 from functools import wraps
 
 Idx = NewType('Idx', int)
+HMMId = NewType('HMMId', str)
+ContigId = NewType('ContigId', str)
+Strand = NewType('Strand', str)
 
 def timeit(func):
+    """Measure the time lapsed"""
     @wraps(func)
     def timeit_wrapper(*args, **kwargs):
         start_time = time.perf_counter()
@@ -27,7 +31,7 @@ def timeit(func):
         print(f'Function {func.__name__} took {total_time:.1f} seconds')
         return result
     return timeit_wrapper
-            
+
 class DAG:
     """The class encapsulating Networkx Digraph object.
 
@@ -208,32 +212,32 @@ class DAG:
         return sequence
 
 @timeit
-def split_graphs(graphml_path_ : Path, tigids, tmpdir : Path) :
-    """Split graphs into single DAGs."""
+def split_graphs(graphml_path_ : Path, contigids : List[ContigId], tmpdir : Path) :
+    """Split graphs into single DAGs"""
 
-    tigid = ""
+    contigid : ContigId = ""
     single_graph=""
     
     with open(graphml_path_) as graphml:
         for line in graphml:
-            if line.startswith('<?xml'):
+            if line.startswith('<?xml'): # start of new graph
 
-                if single_graph and tigid in tigids:
-                    with open(Path(tmpdir, f"{tigid}.graphml"), "w") as tmp:
+                if single_graph and contigid in contigids:
+                    with open(Path(tmpdir, f"{contigid}.graphml"), "w") as tmp:
                         tmp.write(single_graph)
-                        tigid = ""
+                        contigid = ""
                 
                 single_graph = line
 
             else: 
                 single_graph += line
                 if line.startswith('  <graph'):
-                    tigid = line.split()[1].split('"')[1]
+                    contigid = line.split()[1].split('"')[1]
                 
     
     # last graph
-    if tigid in tigids:
-        with open(Path(tmpdir, f"{tigid}.graphml"), "w") as tmp:
+    if contigid in contigids:
+        with open(Path(tmpdir, f"{contigid}.graphml"), "w") as tmp:
             tmp.write(single_graph)
             
 @timeit
@@ -245,13 +249,13 @@ def read_graphml(tmpdir : Path, consensus_id) -> DAG :
     return dag
 
 @timeit
-def fetch_hmm(hmmdb_path : Path, hmmid, tmpdir : Path) :
+def fetch_hmm(hmm_path_ : Path, hmmid : HMMId, tmpdir : Path) :
     """fetch hmm from hmm DB."""
     prev_line = deque(maxlen=1)
     write_on = False
     
     with open(Path(tmpdir, f"{hmmid}.hmm"), "w") as tmp:
-        with open(hmmdb_path) as file:
+        with open(hmm_path_) as file:
             for line in file:
                 
                 if line.startswith(f'HMMER3'):
@@ -275,19 +279,22 @@ def fetch_hmm(hmmdb_path : Path, hmmid, tmpdir : Path) :
     return model
 
 @timeit
-def parse_hmmscanresult(hmmscan_tbl_path_ : Path):
-    """Parse nhmmscan tblout file"""
+def run_nhmmer(contigs_ : Path) -> Set[Tuple[HMMId, ContigId, Strand]]:
+    """Run nhmmer to identify corresponding contigs and their strand"""
+
+    pyhmmer.nhmmer(something)
+
     hits = set()
-    with open(hmmscan_tbl_path_) as f:
-        for line in f:
-            if line.startswith('#'):
-                continue
-            else:
-                li = line.split()
-                target_name = li[0]
-                query_name = li[2]
-                strand = li[11]
-                hits.add((target_name, query_name, strand))
+
+    for line in f:
+        if line.startswith('#'):
+            continue
+        else:
+            li = line.split()
+            target_name = HMMId(li[0]) # profile hmm id
+            query_name = ContigId(li[2]) # contig id
+            strand = Strand(li[11]) # + or -
+            hits.add((target_name, query_name, strand))
     return hits
 
 @timeit
@@ -310,101 +317,111 @@ def make_corrected_consensus_as_seqrecord(corrected_sequence_ : str, consensus_i
 
 parser = argparse.ArgumentParser(prog='Snakehead', description='%(prog)s is a command line program for correcting sequencing errors in Nanopore contigs with pHMM.')
 parser.add_argument('--prefix', '-p', nargs='?')
+
+# input files
+parser.add_argument('--contigs', '-c', nargs='?')
 parser.add_argument('--graphs', '-g', nargs='?')
+parser.add_argument('--hmm', nargs='?')
+
+# output files
 parser.add_argument('--outdir', '-o', nargs='?')
 parser.add_argument('--tmpdir', nargs='?', default='tmp')
-parser.add_argument('--tbl', '-d', nargs='?')
-parser.add_argument('--hmm', nargs='?')
 parser.add_argument('--log', nargs='?')
-parser.add_argument('--minimum_edge_weight', type=int, default=1)
-parser.add_argument('--skip_split_dot', action='store_true', default=False)
+
+# parameters
+#parser.add_argument('--minimum_edge_weight', type=int, default=1)
+parser.add_argument('--skip_split_graphs', action='store_true', default=False)
 
 args = parser.parse_args()
-#args = parser.parse_args(['--prefix', 'test_thrs_3', '--graphs', 'PR8_H1N1.graph.dot', '--outdir', 'test_thrs_3', '--tmpdir', 'tmp', '--domtbl', 'test.domtbl', '--hmm', '/home/kijin/DB/RVDB-prot/v23/U-RVDBv23.0-prot.hmm', '--minimum_edge_weight', '3'])
+#args = parser.parse_args(['--prefix', 'test_thrs_3', '--contigs', 'assembly.fasta', '--graphs', 'PR8_H1N1.graph.dot', '--hmm', '/home/kijin/DB/RVDB-prot/v23/U-RVDBv23.0-prot.hmm', '--outdir', 'test_thrs_3', '--tmpdir', 'tmp'])
 
 
 if __name__ == '__main__':
     bb_start = time.perf_counter()
     print(f"Start the correction for prefix {args.prefix}.")
 
-    hmmscan_tbl_path : Path = Path(args.tbl)
-    graphml_path : Path = Path(args.graphs)
-    hmmdb_path : Path = Path(args.hmm)
+    contigs : Path = Path(args.contigs)
+    graphs : Path = Path(args.graphs)
+    hmm : Path = Path(args.hmm)
     outdir : Path = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     tmpdir : Path = Path(args.tmpdir)
     tmpdir.mkdir(parents=True, exist_ok=True)
-    minimum_edge_weight : int = args.minimum_edge_weight
+    #minimum_edge_weight : int = args.minimum_edge_weight
 
     if args.log:
         log = open(args.log, "a")
 
-    hmmscan_hits = parse_hmmscanresult(hmmscan_tbl_path)
+    hmmscan_hits = run_nhmmer(contigs)
 
-    tigids = []
+    hmmid : HMMId
+    contigid : ContigId
+    strand : Strand
+
+    contigids : List[ContigId] = []
     for hit in hmmscan_hits:
-        hmmid, tigid, strand = hit
-        tigids.append(tigid)
+        hmmid, contigid, strand = hit
+        contigids.append(contigid)
 
-    if not args.skip_split_dot:
-        split_graphs(graphml_path, tigids, tmpdir)
+    if not args.skip_split_graphs:
+        split_graphs(graphs, contigids, tmpdir)
 
     # for compiling _viterbi
-    hmmid, tigid, strand = next(iter(hmmscan_hits))
+    hmmid, contigid, strand = next(iter(hmmscan_hits))
 
     ## load dag
-    dag = read_graphml(tmpdir, tigid)
+    dag = read_graphml(tmpdir, contigid)
 
     ## set up dag
     # if reverse hit, reversed dag needed
     if strand == '-':
         dag.reverse_complement()
 
-    if minimum_edge_weight > 1:
+    #if minimum_edge_weight > 1:
         # filter low-weight edges
-        dag.prun(minimum_edge_weight)
+    #    dag.prun(minimum_edge_weight)
     
     dag.update_ordering()
     dag.update_base_dict()
 
     ## fetch hmm and correct
-    hmm = fetch_hmm(hmmdb_path, hmmid, tmpdir)
+    hmm = fetch_hmm(hmm, hmmid, tmpdir)
     corrected_path = correct(dag, hmm)
 
     for hit in hmmscan_hits:
-        hmmid, tigid, strand = hit
+        hmmid, contigid, strand = hit
 
         b_start = time.perf_counter()
-        print(f"Start the correction. Contig {tigid} with pHMM {hmmid}.")
+        print(f"Start the correction. Contig {contigid} with pHMM {hmmid}.")
 
         ## load dag
-        dag = read_graphml(tmpdir, tigid)
+        dag = read_graphml(tmpdir, contigid)
 
         ## set up dag
         # if reverse hit, reversed dag needed
         if strand == '-':
             dag.reverse_complement()
 
-        if minimum_edge_weight > 1:
+        #if minimum_edge_weight > 1:
             # filter low-weight edges
-            dag.prun(minimum_edge_weight)
+        #    dag.prun(minimum_edge_weight)
         
         dag.update_ordering()
         dag.update_base_dict()
 
         ## fetch hmm and correct
-        hmm = fetch_hmm(hmmdb_path, hmmid, tmpdir)
+        hmm = fetch_hmm(hmm, hmmid, tmpdir)
         corrected_path = correct(dag, hmm)
         corrected_sequence = dag.extract_sequence_from_path(corrected_path)
 
         ## export results
-        SeqIO.write(make_corrected_consensus_as_seqrecord(corrected_sequence, tigid, hmmid), Path(outdir, f"{args.prefix}_{tigid}_{hmmid}.fasta"), "fasta")
+        SeqIO.write(make_corrected_consensus_as_seqrecord(corrected_sequence, contigid, hmmid), Path(outdir, f"{args.prefix}_{contigid}_{hmmid}.fasta"), "fasta")
 
         b_end = time.perf_counter()
-        print(f"End the correction. Contig {tigid} with pHMM {hmmid}. Elapsed time(sec):", b_end - b_start)
+        print(f"End the correction. Contig {contigid} with pHMM {hmmid}. Elapsed time(sec):", b_end - b_start)
 
         if args.log:
-            log.write(f"{args.prefix}\t{tigid}\t{hmmid}\t{b_end - b_start}\n")
+            log.write(f"{args.prefix}\t{contigid}\t{hmmid}\t{b_end - b_start}\n")
 
     if args.log:
         log.close()

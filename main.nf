@@ -2,11 +2,9 @@ nextflow.enable.dsl=2
 
 workflow {
     main:
-    Channel.fromPath(params.graphs).set { graphs }
-    Channel.fromPath(params.hmm_dir, type: 'dir').set { hmm_dir }
     //Canu(fastq)
     //Correct(canu.graphs, params.hmm_dir)
-    Correct(graphs, hmm_dir)
+    Correct(params.graphs, params.hmm)
 }
 
 process Canu {
@@ -27,10 +25,10 @@ process Correct {
 
     input:
         path graphs
-        path hmm_dir
+        path hmm
     output:
         path "out/*"
     """
-    python ${params.script_dir}/modules/snakehead.py --graphs $graphs --hmm $hmm_dir/${params.hmm} --outdir out
+    python ${params.script_dir}/modules/snakehead.py --graphs $graphs --hmm $hmm --outdir out
     """
 }

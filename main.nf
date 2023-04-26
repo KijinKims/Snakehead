@@ -3,8 +3,8 @@ nextflow.enable.dsl=2
 workflow {
     main:
     //Canu(fastq)
-    //Correct(canu.graphs, params.hmm_dir)
-    Correct(params.graphs, params.hmm)
+    //Correct(canu.contigs, canu.graphs, params.hmm_dir)
+    Correct(params.contigs, params.graphs, params.hmm)
 }
 
 process Canu {
@@ -14,6 +14,7 @@ process Canu {
         path fastq
     output:
         path "canu.${params.prefix}/*"
+        path "canu.${params.prefix}/${params.prefix}.contigs.fasta", emit: contigs
         path "canu.${params.prefix}/${params.prefix}.graphml", emit: graphs
     """
     ${params.canu_binary_path} -p ${params.prefix} -d canu.${params.prefix} -nanopore-raw $fastq ${params.canu_high_sens_opts}
@@ -29,6 +30,6 @@ process Correct {
     output:
         path "out/*"
     """
-    python ${params.script_dir}/modules/snakehead.py --graphs $graphs --hmm $hmm --outdir out
+    python ${params.script_dir}/modules/snakehead.py --contigs $contigs --graphs $graphs --hmm $hmm --outdir out
     """
 }

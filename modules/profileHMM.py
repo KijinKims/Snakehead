@@ -13,7 +13,7 @@ except ImportError:
 from math import log
 from typing import List, Dict
 
-from modules.snakehead import DAG, Idx, timeit
+from snakehead import DAG, Idx, timeit
 
 class PHMM:
     """The class encapsulating HMM_profile HMM object.
@@ -57,7 +57,6 @@ class PHMM:
         bases : np.array = np.empty(len(dag_), dtype=np.unicode_ )
 
         for i in range(len(dag_)):
-
             node_id = dag_.index_to_node_id(i)
             pred = dag_.predecessors(node_id)
             for j in range(len(dag_.predecessors(node_id))):
@@ -86,7 +85,8 @@ class PHMM:
 
         t, i, j = tr_start_
 
-        while i != 0:
+        while i > 0:
+            print(t, i, j)
             tr_idx_list.append(i)
 
             t, i, j = (tr_[t][i][j][0], tr_[t][i][j][1], tr_[t][i][j][2])
@@ -143,7 +143,7 @@ class PHMM:
         return np.vstack([transmissions[t] for t in transmission_list])
 
     @staticmethod
-    @jit(nopython=True, cache=True)
+    @jit(nopython=True, cache=True, parallel=True)
     def _viterbi(predecessors_ : np.ndarray, bases_ :np.array, e_M_ : np.ndarray, e_I_ : np.ndarray, a_ : np.ndarray, N_ : int, L_ : int):
         """Inner function for Viterbi algorithm.
         """

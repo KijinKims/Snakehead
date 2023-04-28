@@ -1,3 +1,4 @@
+import sys
 from typing import NewType, Set, Tuple, List
 from collections import defaultdict, deque
 from pathlib import Path, PurePath
@@ -207,28 +208,20 @@ def fetch_hmm(hmm_path_ : Path) :
     return model
 
 @timeit
-def run_nhmmer(hmm_ : Path, contigs_ : Path) -> Set[Tuple[HMMId, ContigId, Strand]]:
-    """Run nhmmer to identify corresponding contigs and their strand"""
-
-    with pyhmmer.plan7.HMMFile(hmm_) as hmm_file:
-        hmm = hmm_file.read()
-
-    with pyhmmer.easel.SequenceFile(contigs_, digital=True) as seq_file:
-        sequences = seq_file.read_block()
-
-    pipeline = pyhmmer.plan7.Pipeline(hmm.alphabet)
-    hits = pipeline.search_hmm(hmm, sequences)
-    
-    target_name = hits.query_name.decode("utf-8")
-
-    res = set()
-
-    for seq in hits:
-        query_name = seq.name.decode("utf-8")
-        bd = seq.best_domain
-        strand = '+' if bd.env_from < bd.env_to else '-'
-        res.add((target_name, query_name, strand))
-    return res
+def parse_nhmmer_result(hmmscan_tbl_path_ : Path):
+    """Parse nhmmer tblout file"""
+    hits = set()
+    with open(hmmscan_tbl_path_) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            else:
+                li = line.split()
+                target_name = li[0]
+                query_name = li[2]
+                strand = li[11]
+                hits.add((target_name, query_name, strand))
+    return hits
 
 @timeit
 def consensus(dag_ : DAG, phmm_ : HMM):
@@ -252,7 +245,7 @@ parser = argparse.ArgumentParser(prog='Snakehead', description='%(prog)s is a co
 parser.add_argument('--prefix', '-p', nargs='?')
 
 # input files
-parser.add_argument('--contigs', '-c', nargs='?')
+parser.add_argument('--tbl', '-c', nargs='?')
 parser.add_argument('--graphs', '-g', nargs='?', help="DAG made by Canu in graphml format.")
 parser.add_argument('--hmm', nargs='?', help="profile HMM file.")
 
@@ -265,13 +258,12 @@ parser.add_argument('--log', nargs='?')
 parser.add_argument('--skip_split_graphs', action='store_true', default=False, help="For less memory use, graphs are stored in 'tempdir' one by one. By turning on this flag, this process can be skipped if it was done before.")
 
 args = parser.parse_args()
-#args = parser.parse_args(['--prefix', 'test_thrs_3', '--contigs', 'assembly.fasta', '--graphs', 'PR8_H1N1.graph.dot', '--hmm', '/home/kijin/DB/RVDB-prot/v23/U-RVDBv23.0-prot.hmm', '--outdir', 'test_thrs_3', '--tmpdir', 'tmp'])
 
 if __name__ == '__main__':
     bb_start = time.perf_counter()
     print(f"Start the correction for prefix {args.prefix}.")
 
-    contigs_file : Path = Path(args.contigs)
+    hmmscan_tbl_file : Path = Path(args.tbl)
     graphs_file : Path = Path(args.graphs)
     hmm_file : Path = Path(args.hmm)
     outdir : Path = Path(args.outdir)
@@ -282,7 +274,9 @@ if __name__ == '__main__':
     if args.log:
         log = open(args.log, "a")
 
-    hmmscan_hits = run_nhmmer(hmm_file, contigs_file)
+    hmmscan_hits = parse_nhmmer_result(hmmscan_tbl_file)
+    if len(hmmscan_hits) == 0:
+        sys.exit("No hits found between given profile HMM and contigs.")
 
     hmmid : HMMId
     contigid : ContigId
@@ -291,7 +285,7 @@ if __name__ == '__main__':
     # extract contig IDs
     contigids : List[ContigId] = []
     for hit in hmmscan_hits:
-        hmmid, contigid, strand = hit
+        contigid, hmmid, strand = hit
         contigids.append(contigid)
 
     # split graphs one by one for less memory use. each graph is stored in 'tempdir' with {graph id}.graphml as file name.
@@ -302,14 +296,16 @@ if __name__ == '__main__':
     # profileHMM._viterbi() is compiled by Numba's @JIT(Just-In-Time) decorator
     # As Numba supports caching the compilation for reuse,
     # correct() function is called only for caching.
-    hmmid, contigid, strand = next(iter(hmmscan_hits))
+    contigid, hmmid, strand = list(hmmscan_hits)[0]
     graph = read_graphml(tmpdir, contigid)
+    graph.update_ordering()
+    graph.update_base_dict()
     hmm = fetch_hmm(hmm_file)
     corr_path = consensus(graph, hmm)
 
     # Actual corrections start from here.
     for hit in hmmscan_hits:
-        hmmid, contigid, strand = hit
+        contigid, hmmid, strand = hit
 
         b_start = time.perf_counter()
         print(f"Start the correction. Contig {contigid} with pHMM {hmmid}.")
@@ -326,7 +322,7 @@ if __name__ == '__main__':
         graph.update_base_dict()
 
         ## fetch hmm and correct
-        hmm = fetch_hmm(hmm, hmmid, tmpdir)
+        hmm = fetch_hmm(hmm_file)
         corr_path = consensus(graph, hmm)
         corr_seq = graph.extract_seq_from_path(corr_path)
 

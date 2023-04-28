@@ -5,7 +5,7 @@ channels:
 dependencies:
   - conda-forge::python>3.7
   - bioconda::nextflow
-  - bioconda::biopython
+  - conda-forge::biopython
   - conda-forge::pydot
   - conda-forge::numpy
   - conda-forge::graph-tool

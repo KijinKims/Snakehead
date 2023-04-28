@@ -13,6 +13,7 @@ import graph_tool.draw
 import profileHMM
 import time
 import argparse
+import pyhmmer
 from functools import wraps
 
 Idx = NewType('Idx', int)
@@ -42,7 +43,6 @@ class DAG:
         _len: An integer count of the nodes in the graph.
         _source: A string indicating the node id of source node in the graph.
         _sink: A string indicating the node id of sink node in the graph.
-        _edge_threshold: An integer indicating the threshold of weight for filtering edges in the graph.
         _node_id_to_index_dict: A dictionary matching every node id to index in self._ordering list. It is updated every time ordering is updated.
     """
 
@@ -90,57 +90,6 @@ class DAG:
     def update_ordering(self):
         """Update ordering"""
         self.ordering = graph_tool.topology.topological_sort(self._graph)
-
-    @timeit
-    def prun(self, edge_threshold_ : int) :
-        """Remove the edges with weights lower than given threshold weight and update the graph and its attribute to make it reasonable.
-        
-        Initially, edges are filtered. It make some obsolete nodes, which has no zero in- and out-degree other than source and sink nodes. Such nodes are excluded from the graph.
-        Update the self._len. Then, connect all zero indegree nodes other than source to source node by generating an edge between them. Likewise, connect all zero outdegree nodes other than sink to sink node.
-
-        Args:
-            edge_threshold_:
-                An integer indicating the threshold of weight for filtering edges in the graph.
-        """
-        assert edge_threshold_ > 0
-        self._edge_threshold = edge_threshold_
-        self.filter_by_edge_weight(self._edge_threshold)
-        #self.clean_obsolete_nodes()
-        self.len(self._graph.num_vertices())
-        self.leave_only_one_source()
-        self.leave_only_one_sink()
-
-    def filter_by_edge_weight(self, threshold_: int) :
-        """Remove all edges with weight<threshold from the graph."""
-        weight_filter = self._graph.new_edge_property("boolean", val=True)
-        for e in self._graph.edges():
-            if self._graph.edge_properties["weight"][e] < threshold_:
-                weight_filter[e] = False
-        
-        self._graph.set_edge_filter(weight_filter)
-        self._graph.purge_edges()
-    
-    def leave_only_one_source(self):
-        """Connect all zero indegree nodes other than source to source"""
-        sources = []
-        for v in self._graph.vertices():
-            if int(v) == self._source or int(v) == self._sink:
-                continue
-            if v.in_degree() == 0:
-                sources.append(int(v))
-        
-        self._graph.add_edge_list([(self._source, x) for x in sources])
-
-    def leave_only_one_sink(self):
-        """Connect all zero outdegree nodes other than sink to sink"""
-        sinks = []
-        for v in self._graph.vertices():
-            if int(v) == self._source or int(v) == self._sink:
-                continue
-            if v.out_degree() == 0:
-                sinks.append(int(v))
-        
-        self._graph.add_edge_list([(x, self._sink) for x in sinks])
 
     def predecessors(self, node_id_):
         return self._graph.get_in_neighbors(node_id_)
@@ -202,7 +151,7 @@ class DAG:
         self.complement()
         self.swap_source_sink()
 
-    def extract_sequence_from_path(self, node_id_list_) -> str:
+    def extract_seq_from_path(self, node_id_list_) -> str:
         """Return the sequence concatenating bases extracted from each node with the node id in given list."""
         sequence : str = ""
         for node_id in node_id_list_:
@@ -249,69 +198,53 @@ def read_graphml(tmpdir : Path, consensus_id) -> DAG :
     return dag
 
 @timeit
-def fetch_hmm(hmm_path_ : Path, hmmid : HMMId, tmpdir : Path) :
-    """fetch hmm from hmm DB."""
-    prev_line = deque(maxlen=1)
-    write_on = False
-    
-    with open(Path(tmpdir, f"{hmmid}.hmm"), "w") as tmp:
-        with open(hmm_path_) as file:
-            for line in file:
-                
-                if line.startswith(f'HMMER3'):
-                    if write_on:
-                        break
+def fetch_hmm(hmm_path_ : Path) :
+    """fetch hmm from profile hmm file."""
 
-                if write_on:
-                    tmp.write(line)
-                
-                if line.startswith(f'NAME  {hmmid}'):
-                    tmp.write(prev_line.pop())
-                    prev_line.clear()
-                    tmp.write(line)
-                    write_on = True
-                
-                prev_line.append(line)
-
-    with open(Path(tmpdir, f"{hmmid}.hmm"), "r") as tmp:
-        model = read_single(tmp)
+    with open(hmm_path_, "r") as f:
+        model = read_single(f)
 
     return model
 
 @timeit
-def run_nhmmer(contigs_ : Path) -> Set[Tuple[HMMId, ContigId, Strand]]:
+def run_nhmmer(hmm_ : Path, contigs_ : Path) -> Set[Tuple[HMMId, ContigId, Strand]]:
     """Run nhmmer to identify corresponding contigs and their strand"""
 
-    pyhmmer.nhmmer(something)
+    with pyhmmer.plan7.HMMFile(hmm_) as hmm_file:
+        hmm = hmm_file.read()
 
-    hits = set()
+    with pyhmmer.easel.SequenceFile(contigs_, digital=True) as seq_file:
+        sequences = seq_file.read_block()
 
-    for line in f:
-        if line.startswith('#'):
-            continue
-        else:
-            li = line.split()
-            target_name = HMMId(li[0]) # profile hmm id
-            query_name = ContigId(li[2]) # contig id
-            strand = Strand(li[11]) # + or -
-            hits.add((target_name, query_name, strand))
-    return hits
+    pipeline = pyhmmer.plan7.Pipeline(hmm.alphabet)
+    hits = pipeline.search_hmm(hmm, sequences)
+    
+    target_name = hits.query_name.decode("utf-8")
+
+    res = set()
+
+    for seq in hits:
+        query_name = seq.name.decode("utf-8")
+        bd = seq.best_domain
+        strand = '+' if bd.env_from < bd.env_to else '-'
+        res.add((target_name, query_name, strand))
+    return res
 
 @timeit
-def correct(dag_ : DAG, phmm_ : HMM):
+def consensus(dag_ : DAG, phmm_ : HMM):
     """Correct the path in DAG using Viterbi algorithm."""
     PHMM = profileHMM.PHMM(phmm_)
     path = PHMM.viterbi(dag_)
 
     return path
 
-def make_corrected_consensus_as_seqrecord(corrected_sequence_ : str, consensus_id_, phmm_id_):
+def sequence_as_seqrecord_with_ids(sequence_ : str, consensus_id_, phmm_id_):
     """Write the corrected consensus as a FASTA format with the header including consensus ID and HMM ID used for correction."""
     seqid = f'{consensus_id_}_corrected_with_{phmm_id_}'
     record = SeqRecord(
-        Seq(corrected_sequence_),
+        Seq(sequence_),
         id=seqid,
-        description=f'{consensus_id_} len={len(corrected_sequence_)}')
+        description=f'{consensus_id_} len={len(sequence_)}')
 
     return record
 
@@ -320,74 +253,61 @@ parser.add_argument('--prefix', '-p', nargs='?')
 
 # input files
 parser.add_argument('--contigs', '-c', nargs='?')
-parser.add_argument('--graphs', '-g', nargs='?')
-parser.add_argument('--hmm', nargs='?')
+parser.add_argument('--graphs', '-g', nargs='?', help="DAG made by Canu in graphml format.")
+parser.add_argument('--hmm', nargs='?', help="profile HMM file.")
 
 # output files
-parser.add_argument('--outdir', '-o', nargs='?')
-parser.add_argument('--tmpdir', nargs='?', default='tmp')
+parser.add_argument('--outdir', '-o', nargs='?', help="Directory that output files will be stored.")
+parser.add_argument('--tmpdir', nargs='?', default='tmp', help="Directory that temporary files will be stored.")
 parser.add_argument('--log', nargs='?')
 
 # parameters
-#parser.add_argument('--minimum_edge_weight', type=int, default=1)
-parser.add_argument('--skip_split_graphs', action='store_true', default=False)
+parser.add_argument('--skip_split_graphs', action='store_true', default=False, help="For less memory use, graphs are stored in 'tempdir' one by one. By turning on this flag, this process can be skipped if it was done before.")
 
 args = parser.parse_args()
 #args = parser.parse_args(['--prefix', 'test_thrs_3', '--contigs', 'assembly.fasta', '--graphs', 'PR8_H1N1.graph.dot', '--hmm', '/home/kijin/DB/RVDB-prot/v23/U-RVDBv23.0-prot.hmm', '--outdir', 'test_thrs_3', '--tmpdir', 'tmp'])
-
 
 if __name__ == '__main__':
     bb_start = time.perf_counter()
     print(f"Start the correction for prefix {args.prefix}.")
 
-    contigs : Path = Path(args.contigs)
-    graphs : Path = Path(args.graphs)
-    hmm : Path = Path(args.hmm)
+    contigs_file : Path = Path(args.contigs)
+    graphs_file : Path = Path(args.graphs)
+    hmm_file : Path = Path(args.hmm)
     outdir : Path = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     tmpdir : Path = Path(args.tmpdir)
     tmpdir.mkdir(parents=True, exist_ok=True)
-    #minimum_edge_weight : int = args.minimum_edge_weight
 
     if args.log:
         log = open(args.log, "a")
 
-    hmmscan_hits = run_nhmmer(contigs)
+    hmmscan_hits = run_nhmmer(hmm_file, contigs_file)
 
     hmmid : HMMId
     contigid : ContigId
-    strand : Strand
+    strand : Strand # if alignment is in reverse order, DAG also should be reversed.
 
+    # extract contig IDs
     contigids : List[ContigId] = []
     for hit in hmmscan_hits:
         hmmid, contigid, strand = hit
         contigids.append(contigid)
 
+    # split graphs one by one for less memory use. each graph is stored in 'tempdir' with {graph id}.graphml as file name.
     if not args.skip_split_graphs:
-        split_graphs(graphs, contigids, tmpdir)
+        split_graphs(graphs_file, contigids, tmpdir)
 
-    # for compiling _viterbi
+
+    # profileHMM._viterbi() is compiled by Numba's @JIT(Just-In-Time) decorator
+    # As Numba supports caching the compilation for reuse,
+    # correct() function is called only for caching.
     hmmid, contigid, strand = next(iter(hmmscan_hits))
+    graph = read_graphml(tmpdir, contigid)
+    hmm = fetch_hmm(hmm_file)
+    corr_path = consensus(graph, hmm)
 
-    ## load dag
-    dag = read_graphml(tmpdir, contigid)
-
-    ## set up dag
-    # if reverse hit, reversed dag needed
-    if strand == '-':
-        dag.reverse_complement()
-
-    #if minimum_edge_weight > 1:
-        # filter low-weight edges
-    #    dag.prun(minimum_edge_weight)
-    
-    dag.update_ordering()
-    dag.update_base_dict()
-
-    ## fetch hmm and correct
-    hmm = fetch_hmm(hmm, hmmid, tmpdir)
-    corrected_path = correct(dag, hmm)
-
+    # Actual corrections start from here.
     for hit in hmmscan_hits:
         hmmid, contigid, strand = hit
 
@@ -395,27 +315,23 @@ if __name__ == '__main__':
         print(f"Start the correction. Contig {contigid} with pHMM {hmmid}.")
 
         ## load dag
-        dag = read_graphml(tmpdir, contigid)
+        graph = read_graphml(tmpdir, contigid)
 
         ## set up dag
         # if reverse hit, reversed dag needed
         if strand == '-':
-            dag.reverse_complement()
+            graph.reverse_complement()
 
-        #if minimum_edge_weight > 1:
-            # filter low-weight edges
-        #    dag.prun(minimum_edge_weight)
-        
-        dag.update_ordering()
-        dag.update_base_dict()
+        graph.update_ordering()
+        graph.update_base_dict()
 
         ## fetch hmm and correct
         hmm = fetch_hmm(hmm, hmmid, tmpdir)
-        corrected_path = correct(dag, hmm)
-        corrected_sequence = dag.extract_sequence_from_path(corrected_path)
+        corr_path = consensus(graph, hmm)
+        corr_seq = graph.extract_seq_from_path(corr_path)
 
         ## export results
-        SeqIO.write(make_corrected_consensus_as_seqrecord(corrected_sequence, contigid, hmmid), Path(outdir, f"{args.prefix}_{contigid}_{hmmid}.fasta"), "fasta")
+        SeqIO.write(sequence_as_seqrecord_with_ids(corr_seq, contigid, hmmid), Path(outdir, f"{args.prefix}_{contigid}_{hmmid}.fasta"), "fasta")
 
         b_end = time.perf_counter()
         print(f"End the correction. Contig {contigid} with pHMM {hmmid}. Elapsed time(sec):", b_end - b_start)

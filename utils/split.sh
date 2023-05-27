@@ -1,0 +1,1 @@
+faSplit byname scaffolds.fa outRoot/

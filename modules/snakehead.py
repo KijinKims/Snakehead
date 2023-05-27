@@ -12,10 +12,12 @@ import graph_tool as gt
 import graph_tool.topology
 import graph_tool.draw
 import profileHMM
+import multiprocessing as mp
 import time
 import argparse
-import pyhmmer
 from functools import wraps
+import shutil
+import numpy as np
 
 Idx = NewType('Idx', int)
 HMMId = NewType('HMMId', str)
@@ -95,6 +97,9 @@ class DAG:
     def predecessors(self, node_id_):
         return self._graph.get_in_neighbors(node_id_)
 
+    def children(self, node_id_):
+        return self._graph.get_out_neighbors(node_id_)
+
     def set_node_id_to_index(self) :
         """Indexize node ids to index in self._ordering in order to make them fit to numpy operations."""
         self._node_id_to_index_dict = { val : Idx(idx) for idx, val in enumerate(self._ordering) }
@@ -160,6 +165,13 @@ class DAG:
                 continue
             sequence += self.base(node_id)
         return sequence
+    
+    def map_contig_coord_to_node_id(self, contig_coord: int):
+        """Return the nod id corresponding the base in contig on the given coordinate"""
+        self._graph.set_vertex_filter(self._graph.vertex_properties['initial_consensus'])
+        res = graph_tool.topology.topological_sort(self._graph)[contig_coord-1]
+        self._graph.clear_filters()
+        return res
 
 @timeit
 def split_graphs(graphml_path_ : Path, contigids : List[ContigId], tmpdir : Path) :
@@ -208,10 +220,10 @@ def fetch_hmm(hmm_path_ : Path) :
     return model
 
 @timeit
-def parse_nhmmer_result(hmmscan_tbl_path_ : Path):
+def parse_nhmmer_result(nhmmer_tbl_path_ : Path):
     """Parse nhmmer tblout file"""
     hits = set()
-    with open(hmmscan_tbl_path_) as f:
+    with open(nhmmer_tbl_path_) as f:
         for line in f:
             if line.startswith('#'):
                 continue
@@ -220,14 +232,23 @@ def parse_nhmmer_result(hmmscan_tbl_path_ : Path):
                 target_name = li[0]
                 query_name = li[2]
                 strand = li[11]
-                hits.add((target_name, query_name, strand))
+                hmm_from = int(li[4])
+                hmm_to = int(li[5])
+                ali_from = int(li[6])
+                ali_to = int(li[7])
+                if ali_from > ali_to:
+                    ali_from, ali_to = ali_to, ali_from
+                hits.add((target_name, query_name, strand, (hmm_from, hmm_to), (ali_from, ali_to)))
     return hits
 
 @timeit
-def consensus(dag_ : DAG, phmm_ : HMM):
+def consensus(dag_ : DAG, phmm_ : HMM, hmm_coords_: Tuple[int, int], ali_node_ids_ : Tuple[int, int]):
     """Correct the path in DAG using Viterbi algorithm."""
+    ali_from_idx = dag_.node_id_to_index(ali_node_ids_[0])
+    ali_to_idx = dag_.node_id_to_index(ali_node_ids_[1])
+    ali_idxs = (ali_from_idx, ali_to_idx)
     PHMM = profileHMM.PHMM(phmm_)
-    path = PHMM.viterbi(dag_)
+    path = PHMM.viterbi(dag_, hmm_coords_[0], ali_idxs)
 
     return path
 
@@ -241,18 +262,81 @@ def sequence_as_seqrecord_with_ids(sequence_ : str, consensus_id_, phmm_id_):
 
     return record
 
+def worker(prefix, tmpdir, hmm_file, hit, log_file, q):
+    '''Worker process'''
+    # Actual corrections start from here.
+    contigid, hmmid, strand, hmm_coords, ali_coords = hit
+
+    b_start = time.perf_counter()
+    print(f"Start the correction of contig {contigid} with pHMM {hmmid}.")
+
+    ## load dag
+    try:
+        graph = read_graphml(tmpdir, contigid)
+    except FileNotFoundError as e:
+        print(f"{e}")
+        return
+
+    ## set up dag
+    # if reverse hit, reversed dag needed
+    if strand == '-':
+        graph.reverse_complement()
+
+    graph.update_ordering()
+    graph.update_base_dict()
+
+
+    ali_from = ali_coords[0]
+    ali_to = ali_coords[1]
+    ali_from_node_id = graph.map_contig_coord_to_node_id(ali_from)
+    ali_to_node_id = graph.map_contig_coord_to_node_id(ali_to)
+    ali_node_ids = (ali_from_node_id, ali_to_node_id)
+
+    ## fetch hmm and correct
+    hmm = fetch_hmm(hmm_file)
+    corr_path = consensus(graph, hmm, hmm_coords, ali_node_ids)
+    corr_seq = graph.extract_seq_from_path(corr_path)
+
+    ## export results
+    SeqIO.write(sequence_as_seqrecord_with_ids(corr_seq, contigid, hmmid), Path(outdir, f"{args.prefix}_{contigid}_{hmmid}.fasta"), "fasta")
+
+    b_end = time.perf_counter()
+    print(f"End the correction of contig {contigid} with pHMM {hmmid}.\nElapsed time(sec)\t", b_end - b_start)
+
+    num_vertices = graph._graph.num_vertices() # number of vertices
+    num_edges = graph._graph.num_edges()
+    sum = 0
+    for v in graph._graph.vertices():
+        sum += v.in_degree()
+    average_indegree = sum / num_vertices
+
+    res = f"{prefix}\t{contigid}\t{hmmid}\t{num_vertices}\t{num_edges}\t{average_indegree}\t{b_end - b_start}"
+    q.put(res)
+    return res
+
+def listener(log_file, q):
+    '''listens for messages on the q, writes to file. '''
+
+    with open(log_file, 'a') as f:
+        while 1:
+            m = q.get()
+            if m == 'kill':
+                break
+            f.write(str(m) + '\n')
+            f.flush()
+
 parser = argparse.ArgumentParser(prog='Snakehead', description='%(prog)s is a command line program for correcting sequencing errors in Nanopore contigs with pHMM.')
 parser.add_argument('--prefix', '-p', nargs='?')
 
 # input files
-parser.add_argument('--tbl', '-c', nargs='?')
+parser.add_argument('--tbl', '-t', nargs='?')
 parser.add_argument('--graphs', '-g', nargs='?', help="DAG made by Canu in graphml format.")
 parser.add_argument('--hmm', nargs='?', help="profile HMM file.")
 
 # output files
 parser.add_argument('--outdir', '-o', nargs='?', help="Directory that output files will be stored.")
 parser.add_argument('--tmpdir', nargs='?', default='tmp', help="Directory that temporary files will be stored.")
-parser.add_argument('--log', nargs='?')
+parser.add_argument('--log', nargs='?', help="Directory that temporary files will be stored.")
 
 # parameters
 parser.add_argument('--skip_split_graphs', action='store_true', default=False, help="For less memory use, graphs are stored in 'tempdir' one by one. By turning on this flag, this process can be skipped if it was done before.")
@@ -263,7 +347,7 @@ if __name__ == '__main__':
     bb_start = time.perf_counter()
     print(f"Start the correction for prefix {args.prefix}.")
 
-    hmmscan_tbl_file : Path = Path(args.tbl)
+    nhmmer_tbl_file : Path = Path(args.tbl)
     graphs_file : Path = Path(args.graphs)
     hmm_file : Path = Path(args.hmm)
     outdir : Path = Path(args.outdir)
@@ -271,11 +355,12 @@ if __name__ == '__main__':
     tmpdir : Path = Path(args.tmpdir)
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    if args.log:
-        log = open(args.log, "a")
+    log_file = Path(outdir, f"{args.prefix}.log")
+    with open(log_file, "w") as f:
+        f.write(f"prefix\tcontig_id\thmm_id\tnum_vertices\tnum_edges\tavg_indegree\ttime\n")
 
-    hmmscan_hits = parse_nhmmer_result(hmmscan_tbl_file)
-    if len(hmmscan_hits) == 0:
+    nhmmer_hits = parse_nhmmer_result(nhmmer_tbl_file)
+    if len(nhmmer_hits) == 0:
         sys.exit("No hits found between given profile HMM and contigs.")
 
     hmmid : HMMId
@@ -284,8 +369,8 @@ if __name__ == '__main__':
 
     # extract contig IDs
     contigids : List[ContigId] = []
-    for hit in hmmscan_hits:
-        contigid, hmmid, strand = hit
+    for hit in nhmmer_hits:
+        contigid, _, _, _, _ = hit
         contigids.append(contigid)
 
     # split graphs one by one for less memory use. each graph is stored in 'tempdir' with {graph id}.graphml as file name.
@@ -296,46 +381,38 @@ if __name__ == '__main__':
     # profileHMM._viterbi() is compiled by Numba's @JIT(Just-In-Time) decorator
     # As Numba supports caching the compilation for reuse,
     # correct() function is called only for caching.
-    contigid, hmmid, strand = list(hmmscan_hits)[0]
-    graph = read_graphml(tmpdir, contigid)
-    graph.update_ordering()
-    graph.update_base_dict()
-    hmm = fetch_hmm(hmm_file)
-    corr_path = consensus(graph, hmm)
+    #contigid, hmmid, strand, hmm_coords, ali_coords = list(hmmscan_hits)[0]
+    #graph = read_graphml(tmpdir, contigid)
+    #graph.update_ordering()
+    #graph.update_base_dict()
+    #hmm = fetch_hmm(hmm_file)
+    #corr_path = consensus(graph, hmm)
 
-    # Actual corrections start from here.
-    for hit in hmmscan_hits:
-        contigid, hmmid, strand = hit
+    #must use Manager queue here, or will not work
+    manager = mp.Manager()
+    q = manager.Queue()    
+    pool = mp.Pool(mp.cpu_count() + 2)
 
-        b_start = time.perf_counter()
-        print(f"Start the correction. Contig {contigid} with pHMM {hmmid}.")
+    #put listener to work first
+    watcher = pool.apply_async(listener, args=(log_file, q, ))
 
-        ## load dag
-        graph = read_graphml(tmpdir, contigid)
+    #fire off workers
+    jobs = []
+    for hit in nhmmer_hits:
+        job = pool.apply_async(worker, args=(args.prefix, tmpdir, hmm_file, hit, log_file, q,))
+        jobs.append(job)
 
-        ## set up dag
-        # if reverse hit, reversed dag needed
-        if strand == '-':
-            graph.reverse_complement()
+    # collect results from the workers through the pool result queue
+    for job in jobs: 
+        job.get()
 
-        graph.update_ordering()
-        graph.update_base_dict()
+    #now we are done, kill the listener
+    q.put('kill')
+    pool.close()
+    pool.join()
 
-        ## fetch hmm and correct
-        hmm = fetch_hmm(hmm_file)
-        corr_path = consensus(graph, hmm)
-        corr_seq = graph.extract_seq_from_path(corr_path)
-
-        ## export results
-        SeqIO.write(sequence_as_seqrecord_with_ids(corr_seq, contigid, hmmid), Path(outdir, f"{args.prefix}_{contigid}_{hmmid}.fasta"), "fasta")
-
-        b_end = time.perf_counter()
-        print(f"End the correction. Contig {contigid} with pHMM {hmmid}. Elapsed time(sec):", b_end - b_start)
-
-        if args.log:
-            log.write(f"{args.prefix}\t{contigid}\t{hmmid}\t{b_end - b_start}\n")
-
-    if args.log:
-        log.close()
+    #shutil.rmtree(tmpdir)
     bb_end = time.perf_counter()
     print(f"End the correction for prefix {args.prefix}. Elapsed time(sec):", bb_end - bb_start)
+
+
